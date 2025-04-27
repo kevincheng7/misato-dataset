@@ -19,10 +19,14 @@
     License along with this library; if not, write to the Free Software 
     Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA'''
 
-import pickle
-import h5py
 import argparse
+import os
+import pickle
+from concurrent.futures import ProcessPoolExecutor
+
+import h5py
 import numpy as np
+from tqdm import tqdm
 
 atomic_numbers_Map = {1:'H', 5:'B', 6:'C', 7:'N', 8:'O', 9:'F',11:'Na',12:'Mg',13:'Al',14:'Si',15:'P',16:'S',17:'Cl',19:'K',20:'Ca',34:'Se',35:'Br',53:'I'}
 
@@ -178,18 +182,50 @@ def create_pdb_lines_QM(trajectory_coordinates, atoms_number, nameMap):
         lines.append(line)
     return lines
 
-def write_pdb(struct, specification, lines):
+def write_pdb(struct, specification, lines, save_dir=None):
     """
-    Write the pdb file
+    Write the pdb file to a specified directory
     Args:
         struct: pdb code
         specification: specification of the pdb file
         lines: list of pdb lines
+        save_dir: save directory (optional)
     """
-    with open(struct+specification+'.pdb', 'w') as of:
-        for line in lines:
-            of.write(line+'\n')
+    if not save_dir:
+        with open(struct+specification+'.pdb', 'w') as of:
+            for line in lines:
+                of.write(line+'\n')
+    else:
+        with open(save_dir, 'w') as of:
+            for line in lines:
+                of.write(line + '\n')
 
+def save_single_struct_frames(h5file_path, mapdir, base_save_dir, struct):
+    """
+    Save all frames for a single struct to PDB
+    """
+    residue_Map, typeMap, nameMap = get_maps(mapdir)
+    with h5py.File(h5file_path, 'r') as f:
+        num_frames = f[struct]['trajectory_coordinates'].shape[0] # type: ignore
+        os.makedirs(os.path.join(base_save_dir, struct, "complex"), exist_ok=True)
+        for frame in range(num_frames):
+            trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index = get_entries(struct, f, frame)
+            lines = create_pdb_lines_MD(trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index, typeMap, residue_Map, nameMap)
+            save_path = os.path.join(base_save_dir, struct, "complex", f"{struct}_frame{frame:03d}.pdb")
+            write_pdb(struct, "", lines, save_path)
+
+def save_all_frames_for_all_structs_MD_parallel(h5file_path, mapdir, base_save_dir, num_workers=8):
+    with h5py.File(h5file_path, 'r') as f:
+        structs = list(f.keys())
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for struct in structs:
+            futures.append(
+                executor.submit(save_single_struct_frames, h5file_path, mapdir, base_save_dir, struct)
+            )
+        for fut in tqdm(futures):
+            fut.result()  # Block until done
 
 
 if __name__=="__main__":
@@ -199,24 +235,29 @@ if __name__=="__main__":
     parser.add_argument("-dMD", "--datasetMD", required=False, help="MD dataset in hdf5 format, e.g. MD_dataset_mapped.hdf5", type=str)
     parser.add_argument("-dQM", "--datasetQM", required=False, help="QM dataset in hdf5 format",  type=str)    
     parser.add_argument("-mdir", "--mapdir", required=False, help="Path to maps", default='Maps/', type=str)
+    parser.add_argument("--base_save_dir", required=False, help="Base absolute save dir when `struct=all`", default="/gpfs/share/home/2201111701/MujieLin/MDdata/Misato", type=str)
     args = parser.parse_args()
 
-    struct = args.struct
-    residue_Map, typeMap, nameMap = get_maps(args.mapdir)
-    if args.datasetMD is not None:
-        f = h5py.File(args.datasetMD, 'r')
-        frame = args.frame
-        trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index = get_entries(struct, f, frame)
-        print('Generating pdb for MD dataset for '+struct+' frame '+str(args.frame))
-        lines = create_pdb_lines_MD(trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index, typeMap,residue_Map, nameMap)
-        write_pdb(struct, '_MD_frame'+str(frame), lines)
-    if args.datasetQM is not None:
-        print('Generating pdb for QM dataset for '+struct)
-        f = h5py.File(args.datasetQM, 'r')
-        coordinates, atoms_number = get_entries_QM(struct, f)
-        print(coordinates, atoms_number)
-        lines = create_pdb_lines_QM(coordinates, atoms_number, nameMap)
-        write_pdb(struct, '_qm', lines)
+    if args.datasetMD is not None and args.struct.lower() == "all":
+        print(f"Generating pdb for all trajectories in MD dataset {args.datasetMD}. Trajectories will be saved to {args.base_save_dir}")
+        save_all_frames_for_all_structs_MD_parallel(args.datasetMD, args.mapdir, args.base_save_dir, num_workers=os.cpu_count() or 1)
+    else:
+        struct = args.struct
+        residue_Map, typeMap, nameMap = get_maps(args.mapdir)
+        if args.datasetMD is not None:
+            f = h5py.File(args.datasetMD, 'r')
+            frame = args.frame
+            trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index = get_entries(struct, f, frame)
+            print('Generating pdb for MD dataset for '+struct+' frame '+str(args.frame))
+            lines = create_pdb_lines_MD(trajectory_coordinates, atoms_type, atoms_number, atoms_residue, molecules_begin_atom_index, typeMap,residue_Map, nameMap)
+            write_pdb(struct, '_MD_frame'+str(frame), lines)
+        if args.datasetQM is not None:
+            print('Generating pdb for QM dataset for '+struct)
+            f = h5py.File(args.datasetQM, 'r')
+            coordinates, atoms_number = get_entries_QM(struct, f)
+            print(coordinates, atoms_number)
+            lines = create_pdb_lines_QM(coordinates, atoms_number, nameMap)
+            write_pdb(struct, '_qm', lines)
 
     if args.datasetQM is None and args.datasetMD is None:
         print('Please provide either a MD or a QM dataset name!')
